@@ -1,5 +1,7 @@
 using DrWatson
 
+@quickactivate "ELM"
+
 println("ELM Julia project initialized.")
-println("Project directory: $(projectdir())")
+println("Project: $(projectdir())")
 println("Julia version: $(VERSION)")
