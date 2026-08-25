@@ -9,6 +9,7 @@ using Dates
 
 const VALIDATION_SCENARIO = get(ENV, "IOT23_VALIDATION_SCENARIO", "dataset12.csv")
 const TEST_SCENARIO = get(ENV, "IOT23_TEST_SCENARIO", "dataset23.csv")
+const REP_SETTING = get(ENV, "IOT23_REPRESENTATION", "all")
 
 function dataset_number(name)
     matched = match(r"dataset(\d+)\.csv$", name)
@@ -80,6 +81,65 @@ function validate_batch(X, y, scenario, preprocessor)
     return
 end
 
+function save_and_validate_preprocessor(preprocessor, train_paths, test_paths, validation_names, test_names, split, raw_directory, output_directory)
+    representation_symbol = preprocessor.representation
+    rep_str = string(representation_symbol)
+    println("\n=== Salvando e Validando Representação: $rep_str ===")
+
+    validation_scenario = only(validation_names)
+    test_scenario = only(test_names)
+    validation_scenario in preprocessor.fitted_scenarios && error("Vazamento do cenário de validação")
+    test_scenario in preprocessor.fitted_scenarios && error("Vazamento do cenário de teste")
+
+    model_path = joinpath(output_directory, "preprocessor_$(rep_str).jls")
+    temporary_model_path = model_path * ".tmp"
+    save_iot23_preprocessor(temporary_model_path, preprocessor)
+    restored = load_iot23_preprocessor(temporary_model_path)
+    restored.feature_names == preprocessor.feature_names || error(
+        "Falha ao restaurar o pré-processador",
+    )
+
+    println("Validando transformação completa do cenário de teste ($test_scenario) em lotes...")
+    test_stats = foreach_iot23_batch(
+        (X, y, scenario) -> validate_batch(X, y, scenario, restored),
+        test_paths,
+        restored;
+        batch_size=100_000,
+    )
+    expected_test = split[split.partition .== "test", :]
+    test_stats.rows == sum(expected_test.rows) || error("Total de teste divergente")
+    test_stats.benign == sum(expected_test.benign) || error("Benignos de teste divergentes")
+    test_stats.malicious == sum(expected_test.malicious) || error("Maliciosos de teste divergentes")
+
+    mv(temporary_model_path, model_path; force=true)
+
+    # Copiar também para o preprocessor.jls padrao se for baseline ou behavioral
+    if representation_symbol == :baseline || representation_symbol == :behavioral
+        cp(model_path, joinpath(output_directory, "preprocessor.jls"); force=true)
+    end
+
+    features_path = joinpath(output_directory, "preprocessor_features_$(rep_str).csv")
+    CSV.write(features_path, feature_table(preprocessor))
+    validation_path = joinpath(output_directory, "preprocessing_validation_$(rep_str).csv")
+    CSV.write(validation_path, DataFrame([(
+        validation_scenario=only(validation_names),
+        test_scenario=only(test_names),
+        rows=test_stats.rows,
+        benign=test_stats.benign,
+        malicious=test_stats.malicious,
+        feature_count=length(preprocessor.feature_names),
+        datatype=string(eltype(preprocessor)),
+        log_transform=preprocessor.log_transform,
+        fitted_scenarios=length(preprocessor.fitted_scenarios),
+        leakage_check="passed_validation_and_test_excluded",
+    )]))
+
+    println("Features produzidas ($(rep_str)): ", length(preprocessor.feature_names))
+    println("Pré-processador: ", model_path)
+    println("Descrição das features: ", features_path)
+    println("Validação: ", validation_path)
+end
+
 function main()
     raw_directory = datadir("exp_raw", "iot23")
     output_directory = datadir("exp_pro", "iot23")
@@ -118,68 +178,37 @@ function main()
     train_rows = sum(split.rows[split.partition .== "train"])
     validation_rows = sum(split.rows[split.partition .== "validation"])
     test_paths = joinpath.(raw_directory, test_names)
-    length(train_names) == 21 || error("Esperados 21 cenários de treino")
-    length(validation_names) == 1 || error("Esperado um cenário de validação")
-    length(test_names) == 1 || error("Esperado um cenário de teste")
 
     println("Início: ", now())
     println("Treino: $(length(train_paths)) cenários / $train_rows linhas")
     println("Validação: $(only(validation_names)) / $validation_rows linhas")
     println("Teste:     $(only(test_names))")
-    println("Ajustando log1p, normalização e vocabulários somente no treino.\n")
 
-    preprocessor = fit_iot23_preprocessor(
-        train_paths;
-        datatype=Float32,
-        log_transform=true,
-        progress=true,
-    )
-    validation_scenario in preprocessor.fitted_scenarios && error("Vazamento do cenário de validação")
-    test_scenario in preprocessor.fitted_scenarios && error("Vazamento do cenário de teste")
-
-    model_path = joinpath(output_directory, "preprocessor.jls")
-    temporary_model_path = model_path * ".tmp"
-    save_iot23_preprocessor(temporary_model_path, preprocessor)
-    restored = load_iot23_preprocessor(temporary_model_path)
-    restored.feature_names == preprocessor.feature_names || error(
-        "Falha ao restaurar o pré-processador",
-    )
-
-    println("\nValidando transformação completa do cenário de teste em lotes...")
-    test_stats = foreach_iot23_batch(
-        (X, y, scenario) -> validate_batch(X, y, scenario, restored),
-        test_paths,
-        restored;
-        batch_size=100_000,
-    )
-    expected_test = split[split.partition .== "test", :]
-    test_stats.rows == sum(expected_test.rows) || error("Total de teste divergente")
-    test_stats.benign == sum(expected_test.benign) || error("Benignos de teste divergentes")
-    test_stats.malicious == sum(expected_test.malicious) || error("Maliciosos de teste divergentes")
-
-    mv(temporary_model_path, model_path; force=true)
-    features_path = joinpath(output_directory, "preprocessor_features.csv")
-    CSV.write(features_path, feature_table(preprocessor))
-    validation_path = joinpath(output_directory, "preprocessing_validation.csv")
-    CSV.write(validation_path, DataFrame([(
-        validation_scenario=only(validation_names),
-        test_scenario=only(test_names),
-        rows=test_stats.rows,
-        benign=test_stats.benign,
-        malicious=test_stats.malicious,
-        feature_count=length(preprocessor.feature_names),
-        datatype=string(eltype(preprocessor)),
-        log_transform=preprocessor.log_transform,
-        fitted_scenarios=length(preprocessor.fitted_scenarios),
-        leakage_check="passed_validation_and_test_excluded",
-    )]))
+    if REP_SETTING == "all"
+        println("\nAjustando todas as representações (:baseline, :light, :behavioral) em uma única passagem pelos dados de treino...")
+        preprocessors = fit_all_iot23_preprocessors(
+            train_paths;
+            datatype=Float32,
+            log_transform=true,
+            progress=true,
+        )
+        for rep in (:baseline, :light, :behavioral)
+            save_and_validate_preprocessor(preprocessors[rep], train_paths, test_paths, validation_names, test_names, split, raw_directory, output_directory)
+        end
+    else
+        rep = Symbol(REP_SETTING)
+        println("\nAjustando representação especificada: $rep...")
+        preprocessor = fit_iot23_preprocessor(
+            train_paths;
+            datatype=Float32,
+            log_transform=true,
+            representation=rep,
+            progress=true,
+        )
+        save_and_validate_preprocessor(preprocessor, train_paths, test_paths, validation_names, test_names, split, raw_directory, output_directory)
+    end
 
     println("\nFim: ", now())
-    println("Features produzidas: ", length(preprocessor.feature_names))
-    println("Split: ", split_path)
-    println("Pré-processador: ", model_path)
-    println("Descrição das features: ", features_path)
-    println("Validação: ", validation_path)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

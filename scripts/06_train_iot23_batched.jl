@@ -102,7 +102,8 @@ function main()
     raw_directory = datadir("exp_raw", "iot23")
     output_directory = datadir("exp_pro", "iot23")
     split = CSV.read(joinpath(output_directory, "scenario_split.csv"), DataFrame)
-    preprocessor = load_iot23_preprocessor(joinpath(output_directory, "preprocessor.jls"))
+    preprocessor_file = get(ENV, "IOT23_PREPROCESSOR_PATH", joinpath(output_directory, "preprocessor.jls"))
+    preprocessor = load_iot23_preprocessor(preprocessor_file)
 
     train = split[split.partition .== "train", :]
     validation = split[split.partition .== "validation", :]

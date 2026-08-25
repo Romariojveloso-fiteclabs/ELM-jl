@@ -164,5 +164,21 @@ end
         @test sampled.sampled_rows == 2
         @test sampled.benign == sampled.malicious == 1
         @test sort(sampled_labels) == Int8[0, 1]
+
+        for rep in (:light, :behavioral)
+            prep_rep = fit_iot23_preprocessor([train_path]; progress=false, representation=rep)
+            @test prep_rep.representation == rep
+            @test "missed_bytes" in prep_rep.numeric_names
+            if rep == :behavioral
+                @test "h_syn" in prep_rep.numeric_names
+                @test "win_flow_count" in prep_rep.numeric_names
+            end
+            rep_X = Matrix{Float32}[]
+            rep_stats = foreach_iot23_batch([test_path], prep_rep; batch_size=1) do X, y, _
+                push!(rep_X, copy(X))
+            end
+            @test rep_stats.rows == 1
+            @test all(isfinite, only(rep_X))
+        end
     end
 end
